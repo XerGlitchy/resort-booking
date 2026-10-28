@@ -3,6 +3,11 @@ import mongoose from "mongoose";
 const reservationSchema = new mongoose.Schema({
   guestName: { type: String, required: true },
   email: { type: String, required: true },
+  userId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    index: true
+  },
   roomId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "Room",
@@ -17,5 +22,7 @@ const reservationSchema = new mongoose.Schema({
     default: "pending"
   }
 }, { timestamps: true });
+
+reservationSchema.index({ roomId: 1, status: 1, checkIn: 1, checkOut: 1 });
 
 export default mongoose.model("Reservation", reservationSchema);

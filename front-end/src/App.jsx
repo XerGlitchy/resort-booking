@@ -1,7 +1,22 @@
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
+import AdminDashboard from "./AdminDashboard.jsx";
+import ProfilePage from "./ProfilePage.jsx";
+import ReservationsPage from "./ReservationsPage.jsx";
+import SiteNotification from "./SiteNotification.jsx";
+import {
+  createReservation,
+  cancelReservation as cancelReservationRequest,
+  deleteReservation,
+  getCurrentUser,
+  getMyReservations,
+  getRooms,
+  loginAccount,
+  registerAccount,
+  sendChatMessages,
+} from "./services/api.js";
 
-const rooms = [
+const initialRooms = [
   {
     id: 1,
     name: "Deluxe Room",
@@ -31,15 +46,49 @@ const rooms = [
   },
 ];
 
+function toCustomerReservation(booking) {
+  const populatedRoom = booking.roomId && typeof booking.roomId === "object"
+    ? booking.roomId
+    : null;
+  const checkIn = new Date(booking.checkIn);
+  const checkOut = new Date(booking.checkOut);
+
+  return {
+    id: booking._id || booking.id,
+    roomId: populatedRoom?._id || booking.roomId,
+    name: booking.guestName || booking.name || "Guest",
+    email: booking.email || "",
+    room: populatedRoom?.name || booking.room || "Room",
+    price: populatedRoom?.pricePerNight ?? booking.price ?? 0,
+    checkIn: Number.isNaN(checkIn.getTime()) ? "" : checkIn.toISOString().slice(0, 10),
+    checkOut: Number.isNaN(checkOut.getTime()) ? "" : checkOut.toISOString().slice(0, 10),
+    guests: String(booking.guestCount ?? booking.guests ?? 1),
+    status: String(booking.status || "pending").toLowerCase(),
+  };
+}
+
 function App() {
   const [page, setPage] = useState("Home");
-  const [selectedRoom, setSelectedRoom] = useState(rooms[0]);
+  const [rooms, setRooms] = useState(initialRooms);
+  const [selectedRoom, setSelectedRoom] = useState(initialRooms[0]);
   const [name, setName] = useState("");
   const [checkIn, setCheckIn] = useState("");
   const [checkOut, setCheckOut] = useState("");
   const [guests, setGuests] = useState("2");
   const [reservations, setReservations] = useState([]);
+  const [rebookingReservationId, setRebookingReservationId] = useState(null);
+  const [cancelConfirmationId, setCancelConfirmationId] = useState(null);
   const [search, setSearch] = useState("");
+  const [auth, setAuth] = useState({
+    token: sessionStorage.getItem("resortBookingToken") || "",
+    user: null,
+  });
+  const [authLoading, setAuthLoading] = useState(Boolean(sessionStorage.getItem("resortBookingToken")));
+  const [authName, setAuthName] = useState("");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [notification, setNotification] = useState(null);
+  const [afterAuthPage, setAfterAuthPage] = useState("Home");
 
   // AI chatbot states
   const [chatOpen, setChatOpen] = useState(false);
@@ -52,44 +101,187 @@ function App() {
     },
   ]);
 
+  useEffect(() => {
+    if (!notification) return undefined;
+    const timer = window.setTimeout(
+      () => setNotification(null),
+      notification.type === "error" ? 8000 : 5500
+    );
+    return () => window.clearTimeout(timer);
+  }, [notification]);
+
+  function notify(type, title, message) {
+    setNotification({ type, title, message });
+  }
+
+  useEffect(() => {
+    let active = true;
+
+    getRooms()
+      .then((serverRooms) => {
+        if (!active || !Array.isArray(serverRooms) || !serverRooms.length) return;
+        const mappedRooms = serverRooms.map((room) => {
+          const localRoom = initialRooms.find((item) => item.name === room.name);
+          return {
+            id: room._id,
+            backendId: room._id,
+            name: room.name,
+            price: room.pricePerNight,
+            capacity: `${room.capacity} ${room.capacity === 1 ? "guest" : "guests"}`,
+            description: room.description || localRoom?.description || "A comfortable resort stay.",
+            image: localRoom?.image || initialRooms[0].image,
+          };
+        });
+        setRooms(mappedRooms);
+        setSelectedRoom((current) => mappedRooms.find((room) => room.name === current.name) || mappedRooms[0]);
+      })
+      .catch(() => {
+        if (active) notify("error", "Rooms couldn't load", "Check that the booking server is running, then try again.");
+      });
+
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+
+    if (!auth.token) {
+      setAuthLoading(false);
+      setReservations([]);
+      return () => { active = false; };
+    }
+
+    setAuthLoading(true);
+    Promise.all([getCurrentUser(auth.token), getMyReservations(auth.token)])
+      .then(([session, savedReservations]) => {
+        if (!active) return;
+        setAuth((current) => ({ ...current, user: session.user }));
+        setReservations(savedReservations.map(toCustomerReservation));
+      })
+      .catch(() => {
+        if (!active) return;
+        sessionStorage.removeItem("resortBookingToken");
+        setAuth({ token: "", user: null });
+        setReservations([]);
+        notify("warning", "Please sign in again", "Your session expired or could not be verified.");
+      })
+      .finally(() => {
+        if (active) setAuthLoading(false);
+      });
+
+    return () => { active = false; };
+  }, [auth.token]);
+
   const filteredRooms = rooms.filter((room) =>
     room.name.toLowerCase().includes(search.toLowerCase())
   );
 
-  function bookRoom(event) {
+  async function bookRoom(event) {
     event.preventDefault();
 
     if (!name.trim() || !checkIn || !checkOut) {
-      alert("Please complete all reservation details.");
+      notify("warning", "Complete your stay details", "Enter your name and choose check-in and check-out dates.");
       return;
     }
 
     if (checkOut <= checkIn) {
-      alert("Check-out must be after check-in.");
+      notify("warning", "Check your dates", "Check-out must be after check-in.");
       return;
     }
 
-    const reservation = {
-      id: Date.now(),
-      name: name.trim(),
-      room: selectedRoom.name,
-      price: selectedRoom.price,
-      checkIn,
-      checkOut,
-      guests,
-      status: "Pending",
-    };
+    if (!selectedRoom.backendId) {
+      notify("error", "Booking unavailable", "This room isn't connected to the booking server yet.");
+      return;
+    }
 
-    setReservations((current) => [...current, reservation]);
-
-    setName("");
-    setCheckIn("");
-    setCheckOut("");
-    setGuests("2");
-    setPage("Reservations");
+    try {
+      const savedBooking = await createReservation({
+        roomId: selectedRoom.backendId,
+        checkIn,
+        checkOut,
+        guestCount: Number(guests),
+        replaceReservationId: rebookingReservationId || undefined,
+      }, auth.token);
+      const savedReservation = toCustomerReservation(savedBooking);
+      setReservations((current) => [
+        ...current.filter((item) => item.id !== rebookingReservationId),
+        savedReservation,
+      ]);
+      setRebookingReservationId(null);
+      setName("");
+      setCheckIn("");
+      setCheckOut("");
+      setGuests("2");
+      setPage("Reservations");
+      notify("success", "Reservation submitted", "Your booking is saved and waiting for resort confirmation.");
+    } catch (error) {
+      notify("error", "Reservation wasn't saved", error.message || "Please try again.");
+    }
   }
 
-  // AI CHATBOT FUNCTION
+  function rebookReservation(reservation) {
+    const room = rooms.find((item) => item.backendId === reservation.roomId || item.name === reservation.room);
+
+    if (!room) return;
+
+    setSelectedRoom(room);
+    setRebookingReservationId(reservation.status === "pending" ? reservation.id : null);
+    setName(reservation.name);
+    setGuests(String(reservation.guests));
+    setCheckIn("");
+    setCheckOut("");
+    setPage("Book");
+  }
+
+  async function handleAuthSubmit(event) {
+    event.preventDefault();
+
+    try {
+      const result = page === "Register"
+        ? await registerAccount({ name: authName, email: authEmail, password: authPassword })
+        : await loginAccount({ email: authEmail, password: authPassword });
+      sessionStorage.setItem("resortBookingToken", result.token);
+      setAuth(result);
+      setAuthPassword("");
+      setPage(afterAuthPage);
+      notify("success", page === "Register" ? "Account created" : "You're signed in", page === "Register" ? "Your account is ready. You can now save bookings." : "You can manage your bookings now.");
+    } catch (error) {
+      notify("error", page === "Register" ? "Account wasn't created" : "Couldn't sign in", error.message || "Please check your details and try again.");
+    }
+  }
+
+  function logOut() {
+    sessionStorage.removeItem("resortBookingToken");
+    setAuth({ token: "", user: null });
+    setReservations([]);
+    setPage("Home");
+  }
+
+  async function removeReservation(reservation) {
+    try {
+      await deleteReservation(reservation.id, auth.token);
+      setReservations((current) => current.filter((item) => item.id !== reservation.id));
+      notify("success", "Reservation deleted", "The pending booking has been removed.");
+    } catch (error) {
+      notify("error", "Couldn't delete reservation", error.message || "Please try again.");
+    }
+  }
+
+  async function cancelBooking(reservation) {
+    try {
+      const cancelledBooking = await cancelReservationRequest(reservation.id, auth.token);
+      const cancelledReservation = toCustomerReservation(cancelledBooking);
+      setReservations((current) => current.map((item) => (
+        item.id === reservation.id ? cancelledReservation : item
+      )));
+      setCancelConfirmationId(null);
+      notify("success", "Booking cancelled", "Your reservation is cancelled and those dates are available again.");
+    } catch (error) {
+      setCancelConfirmationId(null);
+      notify("error", "Couldn't cancel booking", error.message || "Please try again.");
+    }
+  }
+
   async function sendMessage(event) {
     event.preventDefault();
 
@@ -97,67 +289,29 @@ function App() {
 
     if (!userQuestion || isTyping) return;
 
-    const updatedMessages = [
-      ...messages,
+    const chatHistory = [
+      ...messages.filter((message) => message.from === "you" || message.from === "bot"),
       { from: "you", text: userQuestion },
-    ];
+    ].slice(-10).map((message) => ({
+      role: message.from === "you" ? "user" : "assistant",
+      content: message.text,
+    }));
 
-    setMessages(updatedMessages);
+    setMessages((current) => [...current, { from: "you", text: userQuestion }]);
     setQuestion("");
     setIsTyping(true);
 
     try {
-      const response = await fetch(
-        "http://localhost:5001/api/chat",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            messages: updatedMessages
-              .filter(
-                (message) =>
-                  message.from === "you" || message.from === "bot"
-              )
-              .map((message) => ({
-                role:
-                  message.from === "you" ? "user" : "assistant",
-                content: message.text,
-              })),
-          }),
-        }
-      );
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(
-          data.error || "The AI request failed."
-        );
-      }
-
-      setMessages((current) => [
-        ...current,
-        {
-          from: "bot",
-          text:
-            data.reply ||
-            "Sorry, I couldn't generate a response. Please try again.",
-        },
-      ]);
+      const data = await sendChatMessages(chatHistory);
+      setMessages((current) => [...current, {
+        from: "bot",
+        text: data.reply || "The assistant returned an empty response. Please try again.",
+      }]);
     } catch (error) {
-      console.error("Chatbot error:", error);
-
-      setMessages((current) => [
-        ...current,
-        {
-          from: "bot",
-          text:
-            "Sorry! I cannot connect to the AI assistant right now. " +
-            "Please check that the AI server is running, then try again.",
-        },
-      ]);
+      setMessages((current) => [...current, {
+        from: "bot",
+        text: error.message || "The AI assistant could not respond right now. Please try again.",
+      }]);
     } finally {
       setIsTyping(false);
     }
@@ -165,6 +319,11 @@ function App() {
 
   return (
     <div style={styles.app}>
+      <SiteNotification
+        notification={notification}
+        onDismiss={() => setNotification(null)}
+      />
+
       {/* HEADER */}
       <header style={styles.header}>
         <div>
@@ -175,20 +334,47 @@ function App() {
         </div>
 
         <nav style={styles.nav}>
-          {["Home", "Rooms", "Reservations"].map((item) => (
+          {["Home", "Rooms", ...(auth.user ? ["Reservations", "Profile"] : []), ...(auth.user?.role === "admin" ? ["Admin"] : [])].map((item) => (
             <button
               key={item}
               onClick={() => setPage(item)}
               style={{
                 ...styles.navButton,
                 background:
-                  page === item ? "#176b55" : "transparent",
-                color: page === item ? "white" : "#183b32",
+                  page === item ? "#526a42" : "transparent",
+                color: page === item ? "#fffaf2" : "#3f4938",
               }}
             >
               {item}
             </button>
           ))}
+          {!auth.user && !authLoading && (
+            <>
+              <button
+                style={styles.navButton}
+                onClick={() => {
+                  setAfterAuthPage("Home");
+                  setPage("Login");
+                }}
+              >
+                Log in
+              </button>
+              <button
+                style={{ ...styles.navButton, background: "#b96346", color: "#fffaf2" }}
+                onClick={() => {
+                  setAfterAuthPage("Home");
+                  setPage("Register");
+                }}
+              >
+                Create account
+              </button>
+            </>
+          )}
+          {auth.user && (
+            <>
+              <button style={styles.navButton} onClick={logOut}>Log out</button>
+            </>
+          )}
         </nav>
       </header>
 
@@ -234,7 +420,6 @@ function App() {
         <main style={styles.section}>
           <h1>Explore Our Rooms</h1>
           <p>Choose an accommodation for your next stay.</p>
-
           <input
             style={styles.search}
             placeholder="Search rooms..."
@@ -266,7 +451,13 @@ function App() {
                     style={styles.primaryButton}
                     onClick={() => {
                       setSelectedRoom(room);
-                      setPage("Book");
+                      setRebookingReservationId(null);
+                      if (auth.user) {
+                        setPage("Book");
+                      } else {
+                        setAfterAuthPage("Book");
+                        setPage("Login");
+                      }
                     }}
                   >
                     Book This Room
@@ -279,6 +470,62 @@ function App() {
           {filteredRooms.length === 0 && (
             <p>No rooms found.</p>
           )}
+        </main>
+      )}
+
+      {(page === "Login" || page === "Register") && (
+        <main style={styles.section}>
+          <h1>{page === "Register" ? "Create your account" : "Welcome back"}</h1>
+          <p>Sign in to save and manage your resort bookings.</p>
+          <form style={styles.form} onSubmit={handleAuthSubmit}>
+            {page === "Register" && (
+              <label>
+                Full name
+                <input
+                  style={styles.field}
+                  value={authName}
+                  onChange={(event) => setAuthName(event.target.value)}
+                  autoComplete="name"
+                  maxLength={100}
+                  required
+                />
+              </label>
+            )}
+            <label>
+              Email
+              <input
+                style={styles.field}
+                type="email"
+                value={authEmail}
+                onChange={(event) => setAuthEmail(event.target.value)}
+                autoComplete="email"
+                required
+              />
+            </label>
+            <label>
+              Password
+              <input
+                style={styles.field}
+                type="password"
+                value={authPassword}
+                onChange={(event) => setAuthPassword(event.target.value)}
+                autoComplete={page === "Register" ? "new-password" : "current-password"}
+                minLength={8}
+                required
+              />
+            </label>
+            <button style={styles.primaryButton} type="submit">
+              {page === "Register" ? "Create account" : "Log in"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setPage(page === "Register" ? "Login" : "Register");
+              }}
+            >
+              {page === "Register" ? "Already have an account? Log in" : "New here? Create an account"}
+            </button>
+          </form>
         </main>
       )}
 
@@ -351,7 +598,10 @@ function App() {
 
             <button
               type="button"
-              onClick={() => setPage("Rooms")}
+              onClick={() => {
+                setRebookingReservationId(null);
+                setPage("Rooms");
+              }}
             >
               Cancel
             </button>
@@ -361,54 +611,28 @@ function App() {
 
       {/* RESERVATIONS PAGE */}
       {page === "Reservations" && (
-        <main style={styles.section}>
-          <h1>My Reservations</h1>
+        <ReservationsPage
+          reservations={reservations}
+          onExplore={() => setPage("Rooms")}
+          onRebook={rebookReservation}
+          onCancel={setCancelConfirmationId}
+          cancelConfirmationId={cancelConfirmationId}
+          onConfirmCancel={cancelBooking}
+          onKeepBooking={() => setCancelConfirmationId(null)}
+        />
+      )}
 
-          {reservations.length === 0 ? (
-            <p>
-              No reservations have been submitted in this
-              session yet.
-            </p>
-          ) : (
-            <div style={styles.grid}>
-              {reservations.map((reservation) => (
-                <article
-                  key={reservation.id}
-                  style={styles.cardBody}
-                >
-                  <h3>{reservation.room}</h3>
-                  <p>Guest: {reservation.name}</p>
-                  <p>
-                    Price: ₱
-                    {reservation.price.toLocaleString()} / night
-                  </p>
-                  <p>Check-in: {reservation.checkIn}</p>
-                  <p>Check-out: {reservation.checkOut}</p>
-                  <p>Guests: {reservation.guests}</p>
-                  <p>Status: {reservation.status}</p>
+      {page === "Admin" && auth.user?.role === "admin" && (
+        <AdminDashboard token={auth.token} onNotify={notify} />
+      )}
 
-                  <button
-                    onClick={() => {
-                      const confirmed = window.confirm(
-                        "Are you sure you want to delete this reservation?"
-                      );
-
-                      if (confirmed) {
-                        setReservations((current) =>
-                          current.filter(
-                            (item) => item.id !== reservation.id
-                          )
-                        );
-                      }
-                    }}
-                  >
-                    Delete
-                  </button>
-                </article>
-              ))}
-            </div>
-          )}
-        </main>
+      {page === "Profile" && auth.user && (
+        <ProfilePage
+          user={auth.user}
+          reservations={reservations}
+          onNavigate={setPage}
+          onLogOut={logOut}
+        />
       )}
 
       {/* FOOTER */}
@@ -459,12 +683,12 @@ function App() {
                       : "flex-start",
                   background:
                     message.from === "you"
-                      ? "#176b55"
-                      : "#eef2ed",
+                      ? "#b96346"
+                      : "#f2e9db",
                   color:
                     message.from === "you"
-                      ? "white"
-                      : "#183b32",
+                      ? "#fffaf2"
+                      : "#3f4938",
                 }}
               >
                 <strong>
@@ -483,13 +707,15 @@ function App() {
               <div
                 style={{
                   ...styles.message,
-                  background: "#eef2ed",
-                  color: "#183b32",
+                  background: "#f2e9db",
+                  color: "#3f4938",
                 }}
+                role="status"
               >
-                <em>AI Assistant is thinking...</em>
+                <em>Assistant is responding...</em>
               </div>
             )}
+
           </div>
 
           <form
@@ -509,15 +735,12 @@ function App() {
               style={{
                 ...styles.sendButton,
                 opacity: isTyping || !question.trim() ? 0.6 : 1,
-                cursor:
-                  isTyping || !question.trim()
-                    ? "not-allowed"
-                    : "pointer",
+                cursor: isTyping || !question.trim() ? "not-allowed" : "pointer",
               }}
               type="submit"
               disabled={isTyping || !question.trim()}
             >
-              {isTyping ? "..." : "Send"}
+              {isTyping ? "Sending..." : "Send"}
             </button>
           </form>
 
@@ -534,8 +757,8 @@ const styles = {
   app: {
     minHeight: "100vh",
     fontFamily: "Arial, sans-serif",
-    color: "#183b32",
-    background: "#f7f8f3",
+    color: "#3f4938",
+    background: "#f5f0e5",
   },
 
   header: {
@@ -545,20 +768,20 @@ const styles = {
     gap: 20,
     flexWrap: "wrap",
     padding: "22px 6%",
-    background: "white",
-    borderBottom: "1px solid #e3e8df",
+    background: "#fffaf2",
+    borderBottom: "1px solid #e2d8c7",
   },
 
   logo: {
     fontSize: 22,
     letterSpacing: 2,
-    color: "#176b55",
+    color: "#526a42",
   },
 
   tagline: {
     fontSize: 12,
     marginTop: 5,
-    color: "#63746b",
+    color: "#817a68",
   },
 
   nav: {
@@ -580,7 +803,7 @@ const styles = {
     alignItems: "center",
     padding: "55px 8%",
     background:
-      "linear-gradient(90deg, #e3eee5 0%, #e3eee5ee 50%, #e3eee500 100%), url('https://images.unsplash.com/photo-1571896349842-33c89424de2d?auto=format&fit=crop&w=1600&q=80') center/cover",
+      "linear-gradient(90deg, #efe5d4 0%, #efe5d4ed 50%, #efe5d400 100%), url('https://images.unsplash.com/photo-1571896349842-33c89424de2d?auto=format&fit=crop&w=1600&q=80') center/cover",
   },
 
   heroText: {
@@ -609,8 +832,8 @@ const styles = {
     borderRadius: 8,
     padding: "12px 17px",
     marginTop: 12,
-    background: "#176b55",
-    color: "white",
+    background: "#526a42",
+    color: "#fffaf2",
     cursor: "pointer",
   },
 
@@ -619,7 +842,7 @@ const styles = {
     padding: 12,
     width: "min(100%, 350px)",
     margin: "20px 0",
-    border: "1px solid #cbd5ce",
+    border: "1px solid #d5cbb8",
     borderRadius: 8,
   },
 
@@ -631,10 +854,10 @@ const styles = {
   },
 
   card: {
-    background: "white",
+    background: "#fffaf2",
     borderRadius: 14,
     overflow: "hidden",
-    boxShadow: "0 5px 20px #183b3210",
+    boxShadow: "0 5px 20px #493f2d14",
   },
 
   roomImage: {
@@ -645,7 +868,7 @@ const styles = {
 
   cardBody: {
     padding: 20,
-    background: "white",
+    background: "#fffaf2",
     borderRadius: 12,
   },
 
@@ -662,14 +885,14 @@ const styles = {
     width: "100%",
     padding: 12,
     marginTop: 7,
-    border: "1px solid #cbd5ce",
+    border: "1px solid #d5cbb8",
     borderRadius: 8,
   },
 
   footer: {
     textAlign: "center",
     padding: 30,
-    background: "#eaf0e8",
+    background: "#e8e5d5",
     marginTop: 35,
   },
 
@@ -681,10 +904,10 @@ const styles = {
     border: 0,
     borderRadius: 30,
     padding: "14px 20px",
-    background: "#176b55",
-    color: "white",
+    background: "#b96346",
+    color: "#fffaf2",
     cursor: "pointer",
-    boxShadow: "0 5px 20px #0002",
+    boxShadow: "0 5px 20px #43382324",
   },
 
   chatPanel: {
@@ -698,10 +921,10 @@ const styles = {
     width: "min(360px, calc(100vw - 30px))",
     height: "min(500px, calc(100vh - 120px))",
     padding: 16,
-    background: "white",
-    border: "1px solid #dbe4dc",
+    background: "#fffaf2",
+    border: "1px solid #e2d8c7",
     borderRadius: 14,
-    boxShadow: "0 8px 35px #0002",
+    boxShadow: "0 8px 35px #43382324",
   },
 
   chatHeader: {
@@ -710,13 +933,13 @@ const styles = {
     alignItems: "center",
     gap: 10,
     paddingBottom: 12,
-    borderBottom: "1px solid #e3e8df",
+    borderBottom: "1px solid #e2d8c7",
   },
 
   closeButton: {
     border: 0,
     background: "transparent",
-    color: "#183b32",
+    color: "#3f4938",
     fontSize: 18,
     cursor: "pointer",
   },
@@ -745,7 +968,7 @@ const styles = {
     alignItems: "center",
     gap: 8,
     paddingTop: 10,
-    borderTop: "1px solid #e3e8df",
+    borderTop: "1px solid #e2d8c7",
   },
 
   chatInput: {
@@ -753,23 +976,23 @@ const styles = {
     flex: 1,
     minWidth: 0,
     padding: 11,
-    border: "1px solid #cbd5ce",
+    border: "1px solid #d5cbb8",
     borderRadius: 8,
-    outlineColor: "#176b55",
+    outlineColor: "#526a42",
   },
 
   sendButton: {
     border: 0,
     borderRadius: 8,
     padding: "11px 13px",
-    background: "#176b55",
-    color: "white",
+    background: "#526a42",
+    color: "#fffaf2",
     cursor: "pointer",
   },
 
   chatDisclaimer: {
     fontSize: 10,
-    color: "#63746b",
+    color: "#817a68",
     marginBottom: 0,
     textAlign: "center",
   },
